@@ -1,0 +1,381 @@
+#include "vfs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <dirent.h>
+#include <fcntl.h>
+
+// Путь будет заменен автоматически через Makefile
+#define USERS_DIR "/tmp/users"
+#define MOUNT_POINT "/tmp/vfs_mount"
+
+static char mount_point[512] = MOUNT_POINT;
+static char users_dir[512] = USERS_DIR;
+
+// Создание каталога VFS
+void init_users_dir(void) {
+    struct stat st = {0};
+    if (stat(users_dir, &st) == -1) {
+        mkdir(users_dir, 0755);
+        printf("Created users directory: %s\n", users_dir);
+    }
+}
+
+// Создание файлов id, home, shell для пользователя
+void create_user_files(struct passwd* pwd) {
+    if (!pwd) return;
+    
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", users_dir, pwd->pw_name);
+    struct stat st = {0};
+    if (stat(path, &st) == -1) {
+        mkdir(path, 0755);
+    }
+
+    char file[512];
+    FILE* f;
+    
+    // id
+    snprintf(file, sizeof(file), "%s/id", path);
+    f = fopen(file, "w");
+    if (f) {
+        fprintf(f, "%d\n", pwd->pw_uid);
+        fclose(f);
+    }
+    
+    // home
+    snprintf(file, sizeof(file), "%s/home", path);
+    f = fopen(file, "w");
+    if (f) {
+        fprintf(f, "%s\n", pwd->pw_dir);
+        fclose(f);
+    }
+    
+    // shell
+    snprintf(file, sizeof(file), "%s/shell", path);
+    f = fopen(file, "w");
+    if (f) {
+        fprintf(f, "%s\n", pwd->pw_shell);
+        fclose(f);
+    }
+}
+
+// Создание пользователя в системе
+static int create_system_user(const char* username) {
+    printf("Creating system user: %s\n", username);
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Дочерний процесс
+        execlp("sudo", "sudo", "useradd", "-m", "-s", "/bin/bash", username, NULL);
+        // Если execlp не сработал, попробуем без sudo
+        execlp("useradd", "useradd", "-m", "-s", "/bin/bash", username, NULL);
+        exit(1);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            printf("User %s created successfully\n", username);
+            return 0;
+        }
+    }
+    printf("Failed to create user %s\n", username);
+    return -1;
+}
+
+// Удаление пользователя из системы
+static int delete_system_user(const char* username) {
+    printf("Deleting system user: %s\n", username);
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Дочерний процесс
+        execlp("sudo", "sudo", "userdel", "-r", username, NULL);
+        // Если execlp не сработал, попробуем без sudo
+        execlp("userdel", "userdel", "-r", username, NULL);
+        exit(1);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            printf("User %s deleted successfully\n", username);
+            return 0;
+        }
+    }
+    printf("Failed to delete user %s\n", username);
+    return -1;
+}
+
+// Перестройка VFS
+void rebuild_users_vfs(void) {
+    init_users_dir();
+    
+    struct passwd* pwd;
+    setpwent();
+    while ((pwd = getpwent()) != NULL) {
+        // Только пользователи с shell
+        if (pwd->pw_shell && strstr(pwd->pw_shell, "sh")) {
+            create_user_files(pwd);
+        }
+    }
+    endpwent();
+    printf("VFS rebuilt at %s\n", users_dir);
+}
+
+// Список пользователей в VFS
+void list_users_vfs(void) {
+    DIR* dir = opendir(users_dir);
+    if (!dir) {
+        printf("Cannot open VFS directory: %s\n", users_dir);
+        return;
+    }
+    
+    printf("Users in VFS:\n");
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR &&
+            strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            printf("  %s\n", entry->d_name);
+        }
+    }
+    closedir(dir);
+}
+
+// Получение пути к VFS
+const char* get_users_dir(void) {
+    return users_dir;
+}
+
+// ========== FUSE операции ==========
+
+// Получение атрибутов файла/директории
+int vfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    (void)fi;
+    char full_path[1024];
+    
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    int res = lstat(full_path, stbuf);
+    if (res == -1) {
+        // Если файл не существует, создаем виртуальный
+        memset(stbuf, 0, sizeof(struct stat));
+        
+        if (strcmp(path, "/") == 0) {
+            stbuf->st_mode = S_IFDIR | 0755;
+            stbuf->st_nlink = 2;
+        } else {
+            // Проверяем, является ли это пользователем
+            const char* username = path + 1; // Пропускаем '/'
+            if (strchr(username, '/') == NULL) {
+                // Это директория пользователя
+                stbuf->st_mode = S_IFDIR | 0755;
+                stbuf->st_nlink = 2;
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+    
+    return 0;
+}
+
+// Чтение содержимого директории
+int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+    (void)offset;
+    (void)fi;
+    (void)flags;
+    
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    DIR* dir = opendir(full_path);
+    if (!dir) {
+        return -ENOENT;
+    }
+    
+    filler(buf, ".", NULL, 0, 0);
+    filler(buf, "..", NULL, 0, 0);
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            filler(buf, entry->d_name, NULL, 0, 0);
+        }
+    }
+    
+    closedir(dir);
+    return 0;
+}
+
+// Создание директории (и пользователя)
+int vfs_mkdir(const char *path, mode_t mode) {
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    // Извлекаем имя пользователя из пути
+    const char* username = path + 1; // Пропускаем '/'
+    
+    // Создаем директорию
+    int res = mkdir(full_path, mode);
+    if (res == -1) {
+        return -errno;
+    }
+    
+    // Создаем пользователя в системе
+    if (create_system_user(username) == 0) {
+        // Получаем информацию о созданном пользователе
+        struct passwd* pwd = getpwnam(username);
+        if (pwd) {
+            create_user_files(pwd);
+        }
+    }
+    
+    return 0;
+}
+
+// Удаление директории (и пользователя)
+int vfs_rmdir(const char *path) {
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    // Извлекаем имя пользователя из пути
+    const char* username = path + 1; // Пропускаем '/'
+    
+    // Удаляем пользователя из системы
+    delete_system_user(username);
+    
+    // Удаляем директорию
+    int res = rmdir(full_path);
+    if (res == -1) {
+        return -errno;
+    }
+    
+    return 0;
+}
+
+// Открытие файла
+int vfs_open(const char *path, struct fuse_file_info *fi) {
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    int res = open(full_path, fi->flags);
+    if (res == -1) {
+        return -errno;
+    }
+    
+    close(res);
+    return 0;
+}
+
+// Чтение файла
+int vfs_read(const char *path, char *buf, size_t size, off_t offset,
+             struct fuse_file_info *fi) {
+    (void)fi;
+    
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    int fd = open(full_path, O_RDONLY);
+    if (fd == -1) {
+        return -errno;
+    }
+    
+    int res = pread(fd, buf, size, offset);
+    if (res == -1) {
+        res = -errno;
+    }
+    
+    close(fd);
+    return res;
+}
+
+// Запись в файл (не реализована для файлов пользователей)
+int vfs_write(const char *path, const char *buf, size_t size, off_t offset,
+              struct fuse_file_info *fi) {
+    (void)fi;
+    
+    // Не позволяем изменять файлы пользователей
+    if (strstr(path, "/id") || strstr(path, "/home") || strstr(path, "/shell")) {
+        return -EPERM;
+    }
+    
+    char full_path[1024];
+    snprintf(full_path, sizeof(full_path), "%s%s", users_dir, path);
+    
+    int fd = open(full_path, O_WRONLY);
+    if (fd == -1) {
+        return -errno;
+    }
+    
+    int res = pwrite(fd, buf, size, offset);
+    if (res == -1) {
+        res = -errno;
+    }
+    
+    close(fd);
+    return res;
+}
+
+// Монтирование VFS
+int mount_vfs(const char* mountpoint) {
+    if (mountpoint) {
+        strncpy(mount_point, mountpoint, sizeof(mount_point) - 1);
+    }
+    
+    // Создаем точку монтирования
+    mkdir(mount_point, 0755);
+    
+    // Собираем аргументы для fuse_main
+    char* fuse_argv[] = {
+        "kubsh_vfs",
+        "-f",           // foreground mode
+        "-s",           // single-threaded
+        mount_point,
+        NULL
+    };
+    int fuse_argc = 4;
+    
+    // Настраиваем FUSE операции
+    struct fuse_operations vfs_ops = {
+        .getattr = vfs_getattr,
+        .readdir = vfs_readdir,
+        .mkdir   = vfs_mkdir,
+        .rmdir   = vfs_rmdir,
+        .open    = vfs_open,
+        .read    = vfs_read,
+        .write   = vfs_write,
+    };
+    
+    printf("Mounting VFS at %s\n", mount_point);
+    printf("Users directory: %s\n", users_dir);
+    printf("Use 'mkdir /mnt/newuser' to create a new user\n");
+    printf("Use 'rmdir /mnt/existinguser' to delete a user\n");
+    
+    return fuse_main(fuse_argc, fuse_argv, &vfs_ops, NULL);
+}
+
+// Демонтирование VFS
+int unmount_vfs(const char* mountpoint) {
+    const char* mp = mountpoint ? mountpoint : mount_point;
+    
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "fusermount -u %s 2>/dev/null", mp);
+    system(cmd);
+    
+    printf("VFS unmounted from %s\n", mp);
+    return 0;
+}
+
+// Функция для установки директории пользователей
+void set_users_dir(const char* dir) {
+    strncpy(users_dir, dir, sizeof(users_dir) - 1);
+    users_dir[sizeof(users_dir) - 1] = '\0';
+}
